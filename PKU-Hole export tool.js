@@ -2,7 +2,7 @@
 // @name         PKU-Hole export tool
 // @author       WindMan
 // @namespace    http://tampermonkey.net/
-// @version      1.2.0
+// @version      1.2.3
 // @license      MIT License
 // @description  导入/导出树洞中的关注列表
 // @match        https://treehole.pku.edu.cn/web/*
@@ -52,12 +52,16 @@ async function readFileAsync(file) {
 }
 
 
-async function followedHoles() {
+async function followedHoles(bookmarkId = null) {
 	const fetchList = [];
 	let pages = 1024;
 	for (let page = 1; page <= pages; ++page) {
+		let url = `https://treehole.pku.edu.cn/api/follow_v2?page=${page}&limit=25`;
+		if (bookmarkId != null) {
+			url += `&bookmark_id=${encodeURIComponent(bookmarkId)}`;
+		}
 		const response = await fetch(
-			`https://treehole.pku.edu.cn/api/follow_v2?page=${page}&limit=25`,
+			url,
 			{
 				headers: {
 					accept: "application/json, text/plain, */*",
@@ -88,6 +92,108 @@ async function followedHoles() {
 		await sleep(50);
 	}
 	return fetchList;
+}
+
+async function bookmarkGroups() {
+	const response = await fetch(
+		"https://treehole.pku.edu.cn/api/bookmark",
+		{
+			headers: {
+				accept: "application/json, text/plain, */*",
+				"accept-language": "zh-CN,zh;q=0.9",
+				authorization: `Bearer ${_getCookieObj()["pku_token"]}`,
+				"sec-fetch-dest": "empty",
+				"sec-fetch-mode": "cors",
+				"sec-fetch-site": "same-origin",
+				uuid: localStorage.getItem("pku-uuid"),
+			},
+			referrer: "https://treehole.pku.edu.cn/web/",
+			referrerPolicy: "strict-origin-when-cross-origin",
+			body: null,
+			method: "GET",
+			mode: "cors",
+			credentials: "include",
+		}
+	);
+
+	const data_ = await response.json();
+	if (Array.isArray(data_.data)) {
+		return data_.data;
+	}
+	if (data_.data && Array.isArray(data_.data.data)) {
+		return data_.data.data;
+	}
+	return [];
+}
+
+function sanitizeFilenamePart(text) {
+	return text.replace(/[\\/:*?"<>|]/g, "_").trim();
+}
+
+async function selectBookmarkGroup() {
+	const groups = await bookmarkGroups();
+	if (groups.length === 0) {
+		alert("未找到关注分组，已取消导出。");
+		return false;
+	}
+
+	const groupText = groups.map((group, index) => {
+		return `${index + 1}. ${group.bookmark_name} (id: ${group.id})`;
+	}).join("\n");
+	const input = prompt(
+		"选择要导出的关注分组。\n" +
+		"请输入分组编号、分组 id 或完整分组名：\n\n" +
+		groupText
+	);
+	if (input == null) {
+		return false;
+	}
+	const value = input.trim();
+	if (value === "") {
+		alert("未输入分组，已取消导出。");
+		return false;
+	}
+
+	const selected = groups.find((group, index) => {
+		return value === (index + 1).toString() ||
+			value === group.id.toString() ||
+			value === group.bookmark_name;
+	});
+	if (!selected) {
+		alert("未找到匹配的分组，已取消导出。");
+		return false;
+	}
+	return selected;
+}
+
+function exportModeDescription(mode) {
+	if (mode === 2) {
+		return "关注洞 + 正文中提到的洞号";
+	}
+	if (mode === 3) {
+		return "关注洞 + 正文和评论中提到的洞号";
+	}
+	return "仅关注洞";
+}
+
+function selectExportReferenceMode(scopeName) {
+	const mode = prompt(
+		`导出范围：${scopeName}\n\n` +
+		"选择导出内容：\n" +
+		"1. 仅导出这些洞\n" +
+		"2. 同时导出正文中提到的洞号\n" +
+		"3. 同时导出正文和评论中提到的洞号\n\n" +
+		"请输入 1-3",
+		"1"
+	);
+	if (mode == null) {
+		return false;
+	}
+	if (!['1', '2', '3'].includes(mode)) {
+		alert("输入错误，已取消导出。");
+		return false;
+	}
+	return parseInt(mode);
 }
 
 async function comments(holeid) {
@@ -215,7 +321,7 @@ async function processExtract(hole, comments_str, mode) {
 	return pids;
 }
 
-async function exportCitedHoles(buttonElement, holeids, file_num) {
+async function exportCitedHoles(buttonElement, holeids, file_num, filenamePrefix = "export-cited-part-") {
 	let buffer = "";
 	let jsonbuffer = {
 		"holes": [],
@@ -242,8 +348,10 @@ async function exportCitedHoles(buttonElement, holeids, file_num) {
 		}
 
 		if ((i + 1) % 100 == 0 || i == holeids.length - 1) {
-			downloadFile(buffer, "export-cited-part-" + (file_num + 1).toString() + ".txt");
-			downloadFile(JSON.stringify(jsonbuffer), "export-cited-part-" + (file_num + 1).toString() + ".json");
+			if (jsonbuffer.holes.length > 0) {
+				downloadFile(buffer, filenamePrefix + (file_num + 1).toString() + ".txt");
+				downloadFile(JSON.stringify(jsonbuffer), filenamePrefix + (file_num + 1).toString() + ".json");
+			}
 			file_num += 1;
 			buffer = "";
 			jsonbuffer = {
@@ -254,7 +362,48 @@ async function exportCitedHoles(buttonElement, holeids, file_num) {
 	}
 }
 
-async function exportFollowedHoles(buttonElement, mode) {
+function parseHoleIdsFromText(text) {
+	if (text == null) {
+		return [];
+	}
+	const matches = text.match(/\b\d{5,7}\b/g);
+	if (matches == null) {
+		return [];
+	}
+	return Array.from(new Set(matches));
+}
+
+async function exportSpecifiedHoles(buttonElement) {
+	const inputText = prompt(
+		"请输入要导出的洞号。\n" +
+		"多个洞号可用逗号、空格或换行分隔。\n\n" +
+		"示例：123456 234567 345678"
+	);
+	const holeids = parseHoleIdsFromText(inputText);
+	if (holeids.length === 0) {
+		alert("未找到有效洞号，已取消导出。");
+		return;
+	}
+
+	const confirm_ = confirm(
+		`准备导出 ${holeids.length} 个指定洞号。\n` +
+		"每 100 个有效洞生成一组 txt 和 json 文件。\n\n" +
+		"是否开始导出？"
+	);
+	if (!confirm_) {
+		return;
+	}
+
+	buttonElement.textContent = "0";
+	try {
+		await exportCitedHoles(buttonElement, holeids, 0, "export-selected-part-");
+		alert("指定洞号导出完成。");
+	} finally {
+		buttonElement.textContent = "导入/导出";
+	}
+}
+
+async function exportFollowedHoles(buttonElement, mode, bookmarkId = null, filenamePrefix = "export-part-") {
 	// mode:
 	// 1: just export followed holes
 	// 2: export followed holes and holes in the text
@@ -267,7 +416,7 @@ async function exportFollowedHoles(buttonElement, mode) {
 	let holenum = 0;
 	let file_num = 0;
 	let extracted_pids = new Array();
-	let followsholes = await followedHoles();
+	let followsholes = await followedHoles(bookmarkId);
 	// unroll
 	let holes = [];
 	for (let i = 0; i < followsholes.length; i++) {
@@ -297,8 +446,8 @@ async function exportFollowedHoles(buttonElement, mode) {
 
 		sleep(10);
 		if ((i + 1) % 100 == 0 || i == holes.length - 1) {
-			downloadFile(buffer, "export-part-" + (file_num + 1).toString() + ".txt");
-			downloadFile(JSON.stringify(jsonbuffer), "export-part-" + (file_num + 1).toString() + ".json");
+			downloadFile(buffer, filenamePrefix + (file_num + 1).toString() + ".txt");
+			downloadFile(JSON.stringify(jsonbuffer), filenamePrefix + (file_num + 1).toString() + ".json");
 			file_num += 1;
 			buffer = "";
 			jsonbuffer = {
@@ -317,41 +466,40 @@ async function exportFollowedHoles(buttonElement, mode) {
 	}
 }
 
-async function exportHoles(buttonElement) {
+async function exportHoles(buttonElement, group = null) {
 	console.log("export.");
-	// get settings from user
+	const scopeName = group == null ? "全部关注" : `关注分组「${group.bookmark_name}」`;
+	const mode = selectExportReferenceMode(scopeName);
+	if (mode === false) {
+		return;
+	}
+
 	const confirm_ = confirm(
-		"是否确定要导出关注列表？\n" +
-		"每导出100条树洞生成一个文件\n" + 
-		"导出时会实时显示导出树洞的数目" + 
-		"\n若想要停止导出,直接刷新浏览器界面即可"
+		`准备导出：${scopeName}\n` +
+		`导出内容：${exportModeDescription(mode)}\n\n` +
+		"每 100 条树洞生成一组 txt 和 json 文件。\n" +
+		"导出时按钮会显示已处理数量。\n" +
+		"如需停止导出，刷新页面即可。\n\n" +
+		"是否开始导出？"
 	);
 	if (!confirm_) {
 		alert("已取消导出");
 		return;
 	}
 
-	let mode = prompt("请选择导出模式：\n" +
-		"1. 【仅导出】您关注的树洞（默认）\n" +
-		"2. 导出您关注的树洞以及在树洞【正文中】被引的洞\n" +
-		"3. 导出您关注的树洞以及在树洞【正文和评论中】被引的洞\n" +
-		"请输入1-3中的一个数字以选定模式"
-		, "1");
-
-	// bad result
-	if (mode === "0") {
-		alert("已取消导出");
-		return;
-	}
-	if (!['1', '2', '3'].includes(mode)) {
-		alert("输入错误，若想重试请重新点击导出按钮并输入正确的数字");
-		return;
+	let bookmarkId = null;
+	let filenamePrefix = "export-part-";
+	if (group != null) {
+		bookmarkId = group.id;
+		filenamePrefix = "export-" + sanitizeFilenamePart(group.bookmark_name) + "-part-";
 	}
 
-	if (confirm_) {
-		buttonElement.textContent = "稍候";
-		await exportFollowedHoles(buttonElement, parseInt(mode));
-		buttonElement.textContent = "导出";
+	buttonElement.textContent = "稍候";
+	try {
+		await exportFollowedHoles(buttonElement, mode, bookmarkId, filenamePrefix);
+		alert(`${scopeName}导出完成。`);
+	} finally {
+		buttonElement.textContent = "导入/导出";
 	}
 
 }
@@ -489,12 +637,14 @@ async function entrypoint(buttonElement) {
 	// get settings from user
 	const mode_choice = prompt(
 		"选择功能模式：\n" +
-		"1. 导入\n" +
-		"2. 导出\n" + 
-		"请输入1-2中的一个数字以选定模式"
+		"1. 导入关注列表\n" +
+		"2. 导出全部关注\n" +
+		"3. 导出某个关注分组\n" +
+		"4. 导出指定洞号\n\n" +
+		"请输入 1-4"
 	);
 	// bad result
-	if (!['1', '2'].includes(mode_choice)) {
+	if (!['1', '2', '3', '4'].includes(mode_choice)) {
 		return;
 	}
 
@@ -502,6 +652,14 @@ async function entrypoint(buttonElement) {
 		await importHoles(buttonElement);
 	} else if (mode_choice === "2") {
 		await exportHoles(buttonElement);
+	} else if (mode_choice === "3") {
+		const group = await selectBookmarkGroup();
+		if (group === false) {
+			return;
+		}
+		await exportHoles(buttonElement, group);
+	} else if (mode_choice === "4") {
+		await exportSpecifiedHoles(buttonElement);
 	}
 }
 
@@ -516,8 +674,11 @@ async function entrypoint(buttonElement) {
 	buttonElement.addEventListener("click", async function () {
 		if (!running) {
 			running = true;
-			await entrypoint(this);
-			running = false;
+			try {
+				await entrypoint(this);
+			} finally {
+				running = false;
+			}
 		}
 	});
 	if (searchbtnElement) {
